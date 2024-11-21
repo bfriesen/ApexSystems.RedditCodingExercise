@@ -178,7 +178,7 @@ public class AuthenticatingMessageHandlerFacts
 
             var handler = new AuthenticatingMessageHandlerForTests(
                 mockOptionsMonitor.Object, mockLogger.Object,
-                firstRequestTime, secondRequestTime, secondRequestTime)
+                firstRequestTime, secondRequestTime, secondRequestTime, secondRequestTime)
             {
                 InnerHandler = testingMessageHandler,
             };

@@ -14,6 +14,9 @@ public class AuthenticatingMessageHandler(
 {
     public const int ExpirationBufferSeconds = 600;
 
+    // Passing one configures the semaphore to allow one thread access to the code it protects.
+    private readonly SemaphoreSlim _semaphore = new(1);
+
     private readonly IOptionsMonitor<ApplicationOptions> _options = options ?? throw new ArgumentNullException(nameof(options));
     private readonly ILogger<AuthenticatingMessageHandler> _logger = logger ?? throw new ArgumentNullException(nameof(logger));
 
@@ -43,30 +46,46 @@ public class AuthenticatingMessageHandler(
 
     private async Task SetAccessToken(CancellationToken cancellationToken)
     {
-        var options = _options.CurrentValue;
-        var authorization = $"{options.RedditAppClientId}:{options.RedditAppClientSecret}";
-        var encodedAuthorization = Convert.ToBase64String(Encoding.UTF8.GetBytes(authorization));
+        // Only let one thread set the access token at a time.
+        await _semaphore.WaitAsync(cancellationToken);
 
-        var request = new HttpRequestMessage(HttpMethod.Post, options.RedditApiAuthorizationUrl);
-        request.Headers.Authorization = new AuthenticationHeaderValue("Basic", encodedAuthorization);
-        request.Headers.Add("User-Agent", GetUserAgent(options));
-        request.Content = new FormUrlEncodedContent(new Dictionary<string, string>
+        try
         {
-            ["grant_type"] = "password",
-            ["username"] = options.RedditUsername,
-            ["password"] = options.RedditPassword,
-        });
+            // Double check for access token expiration in case the current thread had been blocked
+            // while a different thread was setting the access token.
+            if ((_accessToken, _accessTokenExpiration) is not (null, null) && _accessTokenExpiration > UtcNow)
+                return;
 
-        var response = await base.SendAsync(request, cancellationToken);
-        response.EnsureSuccessStatusCode();
-        var authenticationResponse = await response.Content.ReadFromJsonAsync<AuthenticationResponse>(cancellationToken)
-            ?? throw new InvalidOperationException($"Unexpected null JSON content for {nameof(AuthenticationResponse)}.");
+            var options = _options.CurrentValue;
+            var authorization = $"{options.RedditAppClientId}:{options.RedditAppClientSecret}";
+            var encodedAuthorization = Convert.ToBase64String(Encoding.UTF8.GetBytes(authorization));
 
-        var expiration = UtcNow.AddSeconds(authenticationResponse.expires_in - ExpirationBufferSeconds);
-        _accessTokenExpiration = expiration;
-        _accessToken = authenticationResponse.access_token;
+            var request = new HttpRequestMessage(HttpMethod.Post, options.RedditApiAuthorizationUrl);
+            request.Headers.Authorization = new AuthenticationHeaderValue("Basic", encodedAuthorization);
+            request.Headers.Add("User-Agent", GetUserAgent(options));
+            request.Content = new FormUrlEncodedContent(new Dictionary<string, string>
+            {
+                ["grant_type"] = "password",
+                ["username"] = options.RedditUsername,
+                ["password"] = options.RedditPassword,
+            });
 
-        _logger.LogInformation("Access token set, will expire at {AccessTokenExpiration}.", expiration);
+            var response = await base.SendAsync(request, cancellationToken);
+            response.EnsureSuccessStatusCode();
+            var authenticationResponse = await response.Content.ReadFromJsonAsync<AuthenticationResponse>(cancellationToken)
+                ?? throw new InvalidOperationException($"Unexpected null JSON content for {nameof(AuthenticationResponse)}.");
+
+            var expiration = UtcNow.AddSeconds(authenticationResponse.expires_in - ExpirationBufferSeconds);
+            _accessTokenExpiration = expiration;
+            _accessToken = authenticationResponse.access_token;
+
+            _logger.LogInformation("Access token set, will expire at {AccessTokenExpiration}.", expiration);
+        }
+        finally
+        {
+            // Let other threads set the access token again.
+            _semaphore.Release();
+        }
     }
 
 #pragma warning disable IDE1006
